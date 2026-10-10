@@ -173,10 +173,13 @@ def get_open_meteo(latitude, longitude):
 # ==========================================================
 # 4. Alternative Weather Provider: MET Norway
 # ==========================================================
+
 def get_met_norway(latitude, longitude):
+    from zoneinfo import ZoneInfo
+
     params = {
-        "lat": latitude,
-        "lon": longitude,
+        "lat": float(latitude),
+        "lon": float(longitude),
     }
 
     headers = {
@@ -206,34 +209,28 @@ def get_met_norway(latitude, longitude):
     )
 
     if not timeseries:
-        raise ValueError("Alternative provider returned no forecast.")
+        raise ValueError("MET Norway returned no forecast data.")
 
     rows = []
 
     for item in timeseries:
         time_text = item.get("time")
-        details = (
-            item.get("data", {})
-            .get("instant", {})
-            .get("details", {})
-        )
+        data = item.get("data", {})
+        details = data.get("instant", {}).get("details", {})
 
         if not time_text or not details:
             continue
 
-        # The provider returns UTC timestamps.
         try:
             parsed_time = datetime.fromisoformat(
                 time_text.replace("Z", "+00:00")
             )
             local_time = parsed_time.astimezone(
-                timezone.utc
-            ).astimezone(
-                __import__("zoneinfo").ZoneInfo("Asia/Amman")
+                ZoneInfo("Asia/Amman")
             )
             formatted_time = local_time.strftime("%Y-%m-%dT%H:%M")
         except (ValueError, TypeError):
-            formatted_time = time_text
+            continue
 
         temperature = details.get("air_temperature")
         humidity = details.get("relative_humidity")
@@ -241,22 +238,35 @@ def get_met_norway(latitude, longitude):
         cloud_cover = details.get("cloud_area_fraction")
         wind_speed = details.get("wind_speed")
 
-        next_data = item.get("data", {}).get("next_1_hours", {})
-        precipitation = (
-            next_data.get("details", {}).get("precipitation_amount")
-        )
-
-        # Do not invent missing measurements.
+        # These measurements are required by the trained model.
         required_values = [
             temperature,
             humidity,
             dew_point,
             cloud_cover,
             wind_speed,
-            precipitation,
         ]
 
         if any(value is None for value in required_values):
+            continue
+
+        # Precipitation may be missing from next_1_hours.
+        # Try next_6_hours as well; do not invent a value.
+        precipitation = None
+
+        for period in ("next_1_hours", "next_6_hours"):
+            period_data = data.get(period, {})
+            amount = period_data.get("details", {}).get(
+                "precipitation_amount"
+            )
+
+            if amount is not None:
+                precipitation = float(amount)
+                break
+
+        # Without precipitation, this row cannot safely be used
+        # as a complete input to the existing model.
+        if precipitation is None:
             continue
 
         rows.append({
@@ -264,7 +274,7 @@ def get_met_norway(latitude, longitude):
             "temperature_2m": float(temperature),
             "relative_humidity_2m": float(humidity),
             "dew_point_2m": float(dew_point),
-            "precipitation": float(precipitation),
+            "precipitation": precipitation,
             "cloud_cover": float(cloud_cover),
             "wind_speed_10m": float(wind_speed) * 3.6,
         })
@@ -273,11 +283,17 @@ def get_met_norway(latitude, longitude):
 
     if weather.empty:
         raise ValueError(
-            "البيانات البديلة لا تحتوي على جميع القياسات اللازمة للموديل."
+            "MET Norway did not provide enough complete hourly "
+            "measurements for the model, including precipitation."
         )
 
     weather = weather.drop_duplicates(subset=["time"])
     weather = weather.sort_values("time").reset_index(drop=True)
+
+    print(
+        f"[WEATHER] MET Norway usable rows: {len(weather)}",
+        flush=True,
+    )
 
     return weather
 
