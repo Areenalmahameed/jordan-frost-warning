@@ -1,86 +1,162 @@
+
 # -*- coding: utf-8 -*-
 import os
+import json
 import time
 from pathlib import Path
+from datetime import datetime
 
 import gradio as gr
 import joblib
 import pandas as pd
 import requests
 
+
 # ==========================================================
-# Load Model
+# 1. Load Model
 # ==========================================================
 BASE_DIR = Path(__file__).resolve().parent
+
 MODEL_PATH = BASE_DIR / "frost_random_forest.pkl"
 INFO_PATH = BASE_DIR / "frost_model_info.pkl"
+CACHE_FILE = BASE_DIR / "weather_cache.json"
+
+WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+
+CACHE_DURATION = 6 * 60 * 60
+MAX_STALE_DURATION = 48 * 60 * 60
 
 if not MODEL_PATH.exists() or not INFO_PATH.exists():
     raise FileNotFoundError(
-        "تأكدي من وجود frost_random_forest.pkl و frost_model_info.pkl"
+        "تأكدي من وجود frost_random_forest.pkl "
+        "و frost_model_info.pkl بجانب app.py"
     )
 
 model = joblib.load(MODEL_PATH)
 model_info = joblib.load(INFO_PATH)
+
 features = model_info["features"]
 threshold = float(model_info.get("threshold", 0.20))
 
+
 # ==========================================================
-# Weather API + Cache
+# 2. Persistent Weather Cache
 # ==========================================================
-weather_cache = {}
-CACHE_DURATION =  6 * 60 * 60
-MAX_STALE_DURATION = 48 * 60 * 60
-WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+def load_cache():
+    try:
+        if CACHE_FILE.exists():
+            with open(CACHE_FILE, "r", encoding="utf-8") as file:
+                data = json.load(file)
+                return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    return {}
 
 
+weather_cache = load_cache()
+
+
+def save_cache():
+    """Save successful forecasts to disk."""
+    temp_file = CACHE_FILE.with_suffix(".tmp")
+
+    try:
+        with open(temp_file, "w", encoding="utf-8") as file:
+            json.dump(weather_cache, file, ensure_ascii=False)
+
+        os.replace(temp_file, CACHE_FILE)
+
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"[CACHE] Could not save cache: {exc}", flush=True)
+
+
+def cache_key_for(latitude, longitude):
+    return f"{float(latitude):.4f},{float(longitude):.4f}"
+
+
+def get_cached_weather(key):
+    entry = weather_cache.get(key)
+
+    if not isinstance(entry, dict):
+        return None, None
+
+    try:
+        timestamp = float(entry["timestamp"])
+        rows = entry["data"]
+        weather = pd.DataFrame(rows)
+
+        if weather.empty:
+            return None, None
+
+        return timestamp, weather
+
+    except (KeyError, TypeError, ValueError):
+        return None, None
+
+
+# ==========================================================
+# 3. Get Weather
+# ==========================================================
 def get_weather(latitude, longitude):
-    cache_key = (
-        round(float(latitude), 4),
-        round(float(longitude), 4),
-    )
+    latitude = float(latitude)
+    longitude = float(longitude)
 
+    key = cache_key_for(latitude, longitude)
     now = time.time()
-    cached = weather_cache.get(cache_key)
 
-    # Return fresh cached forecast without making another API request.
-    if cached and 0 <= now - cached[0] < CACHE_DURATION:
-        return cached[1].copy()
+    cached_timestamp, cached_weather = get_cached_weather(key)
+
+    # Return fresh cached data without contacting the API.
+    if (
+        cached_weather is not None
+        and cached_timestamp is not None
+        and 0 <= now - cached_timestamp < CACHE_DURATION
+    ):
+        print(f"[CACHE] Fresh cache used for {key}", flush=True)
+        return cached_weather.copy()
 
     params = {
         "latitude": latitude,
         "longitude": longitude,
-        "hourly": [
-            "temperature_2m",
-            "relative_humidity_2m",
-            "dew_point_2m",
-            "precipitation",
-            "cloud_cover",
-            "wind_speed_10m",
-        ],
+        "hourly": (
+            "temperature_2m,"
+            "relative_humidity_2m,"
+            "dew_point_2m,"
+            "precipitation,"
+            "cloud_cover,"
+            "wind_speed_10m"
+        ),
         "timezone": "Asia/Amman",
         "forecast_days": 3,
     }
 
     last_error = "Unknown error"
 
-    # Only one request per call: avoid increasing rate limits with retries.
+    # Make one request per attempt; avoid excessive API requests.
     try:
         response = requests.get(
             WEATHER_URL,
             params=params,
             timeout=20,
+            headers={"User-Agent": "JordanFrostWarning/1.0"},
+        )
+
+        print(
+            f"[WEATHER] HTTP status: {response.status_code}",
+            flush=True,
         )
 
         if response.status_code == 429:
             last_error = "Open-Meteo HTTP 429: Too Many Requests"
+
         else:
             response.raise_for_status()
             payload = response.json()
 
             if "hourly" not in payload:
                 raise ValueError(
-                    "Weather API did not return hourly data"
+                    "لم تُرجع خدمة الطقس بيانات الساعات المطلوبة."
                 )
 
             weather = pd.DataFrame(payload["hourly"])
@@ -106,15 +182,14 @@ def get_weather(latitude, longitude):
                 )
 
             if weather.empty:
-                raise ValueError(
-                    "Weather API returned an empty forecast"
-                )
+                raise ValueError("بيانات الطقس فارغة.")
 
-            # Store successful forecast in memory.
-            weather_cache[cache_key] = (
-                time.time(),
-                weather.copy(),
-            )
+            # Save the forecast and its retrieval timestamp.
+            weather_cache[key] = {
+                "timestamp": time.time(),
+                "data": weather.to_dict(orient="records"),
+            }
+            save_cache()
 
             return weather
 
@@ -124,45 +199,68 @@ def get_weather(latitude, longitude):
     except (ValueError, KeyError, TypeError) as exc:
         last_error = str(exc)
 
-    # If the API fails, use a previously successful cached forecast
-    # only when it is within the allowed age.
-    cached = weather_cache.get(cache_key)
+    # If the API fails, use a previously saved forecast if recent enough.
+    cached_timestamp, cached_weather = get_cached_weather(key)
 
-    if cached:
-        age = time.time() - cached[0]
+    if cached_weather is not None and cached_timestamp is not None:
+        age = time.time() - cached_timestamp
 
         if 0 <= age <= MAX_STALE_DURATION:
-            return cached[1].copy()
+            print(
+                f"[CACHE] Using saved forecast for {key}; "
+                f"age={age / 3600:.1f} hours",
+                flush=True,
+            )
+            return cached_weather.copy()
 
     raise RuntimeError(
-        "تعذر جلب بيانات الطقس حاليًا، ولا توجد بيانات "
-        "محفوظة يمكن استخدامها. حاولي لاحقًا. "
+        "تعذر جلب بيانات الطقس حاليًا، ولا توجد بيانات محفوظة "
+        "صالحة لهذا الموقع. انتظري قليلًا ثم حاولي مرة أخرى. "
         f"Details: {last_error}"
     )
 
 
-
+# ==========================================================
+# 4. Frost Risk Prediction
+# ==========================================================
 def check_frost_risk(latitude, longitude):
-    weather = get_weather(latitude, longitude).rename(columns={
+    weather = get_weather(latitude, longitude)
+
+    # Match API column names to the model's expected feature names.
+    rename_map = {
         "temperature_2m": "temperature_2m (°C)",
         "relative_humidity_2m": "relative_humidity_2m (%)",
         "dew_point_2m": "dew_point_2m (°C)",
         "precipitation": "precipitation (mm)",
         "cloud_cover": "cloud_cover (%)",
         "wind_speed_10m": "wind_speed_10m (km/h)",
-    }).copy()
+    }
 
-    missing = [f for f in features if f not in weather.columns]
+    weather = weather.rename(columns=rename_map).copy()
+
+    missing = [feature for feature in features
+               if feature not in weather.columns]
+
     if missing:
-        raise ValueError(f"Missing model features: {missing}")
+        raise ValueError(
+            "خصائص الطقس لا تتطابق مع الموديل. "
+            f"الخصائص المفقودة: {missing}"
+        )
 
-    probabilities = model.predict_proba(weather[features])
+    # Keep the exact feature order used during training.
+    X = weather[features].copy()
+    probabilities = model.predict_proba(X)
+
     classes = list(model.classes_)
 
     if 1 not in classes:
-        raise ValueError("The model does not contain frost class 1")
+        raise ValueError(
+            "الموديل لا يحتوي على الفئة 1 الخاصة بالصقيع. "
+            "راجعي ترميز الفئات عند التدريب."
+        )
 
-    weather["frost_probability"] = probabilities[:, classes.index(1)]
+    frost_index = classes.index(1)
+    weather["frost_probability"] = probabilities[:, frost_index]
     weather["frost_risk"] = (
         weather["frost_probability"] >= threshold
     ).astype(int)
@@ -171,7 +269,7 @@ def check_frost_risk(latitude, longitude):
 
 
 # ==========================================================
-# Jordan Locations
+# 5. Jordan Locations
 # ==========================================================
 jordan_locations = {
     "عمّان": {
@@ -240,81 +338,121 @@ jordan_locations = {
     },
 }
 
+
 # ==========================================================
-# Crop Types
+# 6. Crop Types and Advice
 # ==========================================================
 crop_types = {
     "🥬 خضروات ورقية": {
         "name": "الخضروات الورقية",
-        "advice": "تابعي درجات الحرارة ليلًا والصباح الباكر، وانتَبهي للمحاصيل الحساسة للبرد.",
+        "advice": (
+            "تابعي درجات الحرارة ليلًا والصباح الباكر، "
+            "وانتبهي للمحاصيل الحساسة للبرد."
+        ),
     },
     "🍅 خضروات مثمرة": {
         "name": "الخضروات المثمرة",
-        "advice": "تابعي انخفاض درجات الحرارة واتخذي إجراءات الحماية المناسبة عند ارتفاع خطر الصقيع.",
+        "advice": (
+            "تابعي انخفاض درجات الحرارة واتخذي إجراءات "
+            "الحماية المناسبة عند ارتفاع خطر الصقيع."
+        ),
     },
     "🍊 أشجار مثمرة": {
         "name": "الأشجار المثمرة",
-        "advice": "راقبي فترة الصقيع المتوقعة، خصوصًا خلال ساعات الليل والصباح الباكر.",
+        "advice": (
+            "راقبي فترة الصقيع المتوقعة، خصوصًا خلال "
+            "ساعات الليل والصباح الباكر."
+        ),
     },
     "🌾 محاصيل حقلية": {
         "name": "المحاصيل الحقلية",
-        "advice": "تابعي التوقعات الجوية وقيّمي حساسية المحصول للبرد قبل اتخاذ أي إجراء.",
+        "advice": (
+            "تابعي التوقعات الجوية وقيّمي حساسية المحصول "
+            "للبرد قبل اتخاذ أي إجراء."
+        ),
     },
     "🌿 أعشاب ونباتات": {
         "name": "الأعشاب والنباتات",
-        "advice": "تابعي درجات الحرارة واحمي النباتات الحساسة عند ارتفاع مستوى الخطر.",
+        "advice": (
+            "تابعي درجات الحرارة واحمي النباتات الحساسة "
+            "عند ارتفاع مستوى الخطر."
+        ),
     },
 }
 
 
 # ==========================================================
-# Prediction
+# 7. Generate Result
 # ==========================================================
 def predict_frost_final(governorate, area, crop):
     try:
+        if not governorate or not area or not crop:
+            return (
+                '<div class="error-card" dir="rtl">'
+                "<h2>يرجى اختيار المحافظة والمنطقة والمحصول.</h2>"
+                "</div>"
+            )
+
         latitude, longitude = jordan_locations[governorate][area]
         crop_info = crop_types[crop]
 
         weather = check_frost_risk(latitude, longitude).copy()
 
-        min_temperature = weather["temperature_2m (°C)"].min()
-        probability = weather["frost_probability"].max()
+        min_temperature = float(
+            weather["temperature_2m (°C)"].min()
+        )
+
+        # Use the highest predicted probability in the forecast.
+        probability = float(weather["frost_probability"].max())
         probability_percent = probability * 100
 
         if probability_percent >= 20:
             level = "🔴 خطر مرتفع"
             color = "#dc2626"
             background = "#fee2e2"
-            risk_message = "توجد احتمالية مرتفعة للصقيع."
-            action = "استعدي لحماية المحصول واتخذي الإجراءات الوقائية المناسبة."
+            risk_message = "توجد احتمالية مرتفعة للصقيع وفق الموديل."
+            action = (
+                "تابعي التحديثات الجوية واستشيري الإرشادات "
+                "الزراعية المحلية بشأن حماية المحصول."
+            )
+
         elif probability_percent >= 10:
             level = "🟡 خطر متوسط"
             color = "#d97706"
             background = "#fef3c7"
-            risk_message = "توجد احتمالية متوسطة للصقيع."
-            action = "تابعي درجات الحرارة خلال الليل والصباح الباكر."
+            risk_message = "توجد احتمالية متوسطة للصقيع وفق الموديل."
+            action = (
+                "تابعي درجات الحرارة خلال الليل والصباح الباكر."
+            )
+
         else:
             level = "🟢 خطر منخفض"
             color = "#16a34a"
             background = "#dcfce7"
-            risk_message = "لا يوجد خطر مرتفع للصقيع وفق التوقعات الحالية."
+            risk_message = (
+                "احتمال الصقيع منخفض وفق توقعات الموديل الحالية."
+            )
             action = "استمري بمتابعة التحديثات الجوية."
 
-        risk_hours = weather[weather["frost_probability"] >= 0.20]
+        risk_hours = weather[
+            weather["frost_probability"] >= threshold
+        ]
 
         if not risk_hours.empty:
-            risk_period = (
-                f"من {risk_hours['time'].iloc[0]} "
-                f"إلى {risk_hours['time'].iloc[-1]}"
-            )
+            first_time = str(risk_hours["time"].iloc[0])
+            last_time = str(risk_hours["time"].iloc[-1])
+            risk_period = f"من {first_time} إلى {last_time}"
         else:
-            risk_period = "لا توجد ساعات ذات خطر مرتفع وفق العتبة المحددة."
+            risk_period = (
+                "لا توجد ساعات تجاوزت عتبة الخطر المحددة في الموديل."
+            )
 
+        # Display the next six forecast entries.
         hours_html = ""
 
         for _, row in weather.head(6).iterrows():
-            temp = row["temperature_2m (°C)"]
-            pct = row["frost_probability"] * 100
+            temp = float(row["temperature_2m (°C)"])
+            pct = float(row["frost_probability"]) * 100
 
             if pct >= 20:
                 status = "🔴 مرتفع"
@@ -323,18 +461,23 @@ def predict_frost_final(governorate, area, crop):
             else:
                 status = "🟢 منخفض"
 
+            forecast_time = str(row["time"])
+
             hours_html += f"""
-            <tr>
-                <td>{row['time']}</td>
-                <td>{temp:.1f} °C</td>
-                <td>{pct:.1f}%</td>
-                <td>{status}</td>
-            </tr>
+                <tr>
+                    <td>{forecast_time}</td>
+                    <td>{temp:.1f} °C</td>
+                    <td>{pct:.1f}%</td>
+                    <td>{status}</td>
+                </tr>
             """
+
+        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         return f"""
         <div class="result-card" dir="rtl">
             <h2 class="result-title">🌱 نتيجة فحص خطر الصقيع</h2>
+            <p class="updated-at">وقت الفحص: {generated_at}</p>
             <hr class="green-line">
 
             <div class="info-section">
@@ -353,14 +496,15 @@ def predict_frost_final(governorate, area, crop):
             </div>
 
             <div class="info-section">
-                <div class="info-label">❄️ احتمال الصقيع</div>
+                <div class="info-label">❄️ أعلى احتمال صقيع يتنبأ به الموديل</div>
                 <div class="temperature-value">{probability_percent:.1f}%</div>
             </div>
 
             <div class="info-section">
                 <div class="info-label">⚠️ مستوى الخطر</div>
                 <div class="risk-badge"
-                     style="color:{color};background:{background};border-color:{color}">
+                     style="color:{color};background:{background};
+                            border-color:{color}">
                     {level}
                 </div>
             </div>
@@ -371,7 +515,7 @@ def predict_frost_final(governorate, area, crop):
             </div>
 
             <div class="recommendation" style="background:{background}">
-                <b>🌱 توصيات للمزارع — {crop_info['name']}</b>
+                <b>🌱 إرشادات للمحصول — {crop_info['name']}</b>
                 <p>{risk_message}</p>
                 <p>{action}</p>
                 <p>{crop_info['advice']}</p>
@@ -395,26 +539,38 @@ def predict_frost_final(governorate, area, crop):
             </div>
 
             <p class="disclaimer">
-                هذه نتيجة تقديرية تعتمد على بيانات الطقس والموديل المدرب،
-                وليست ضمانًا لحدوث الصقيع أو عدم حدوثه.
+                النتيجة تقديرية وتعتمد على الموديل المدرب وبيانات الطقس.
+                احتمال الصقيع الذي يعرضه التطبيق هو تقدير الموديل،
+                وليس بالضرورة احتمالًا رسميًا صادرًا عن خدمة الطقس.
             </p>
         </div>
         """
 
     except Exception as exc:
-        # Avoid showing a technical traceback to the app visitor.
-        error_text = str(exc).replace("<", "&lt;").replace(">", "&gt;")
+        print(f"[PREDICTION ERROR] {exc}", flush=True)
+
+        error_text = (
+            str(exc)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
         return f"""
         <div class="error-card" dir="rtl">
             <h2>❌ تعذر فحص خطر الصقيع</h2>
             <p>{error_text}</p>
-            <p>انتظري قليلًا ثم حاولي مرة أخرى.</p>
+            <p>حاولي مرة أخرى لاحقًا إذا كانت خدمة الطقس غير متاحة.</p>
         </div>
         """
 
 
+# ==========================================================
+# 8. Update Areas When Governorate Changes
+# ==========================================================
 def update_area(governorate):
     areas = list(jordan_locations[governorate].keys())
+
     return gr.Dropdown(
         choices=areas,
         value=areas[0],
@@ -423,17 +579,18 @@ def update_area(governorate):
 
 
 # ==========================================================
-# CSS
+# 9. CSS Design
 # ==========================================================
 css = """
 .gradio-container {
-    max-width: 1000px !important;
+    max-width: 1100px !important;
     margin: auto !important;
     background: linear-gradient(135deg, #052e16, #14532d, #166534) !important;
     min-height: 100vh;
 }
-body { background: #052e16 !important; }
-
+body {
+    background: #052e16 !important;
+}
 .header {
     background: linear-gradient(135deg, #166534, #15803d);
     color: white;
@@ -442,101 +599,116 @@ body { background: #052e16 !important; }
     border-radius: 0 0 25px 25px;
     margin-bottom: 25px;
 }
-.header h1 { font-size: 32px !important; }
-
+.header h1 {
+    font-size: 32px !important;
+}
+.header p {
+    font-size: 17px;
+}
 .location-box {
     background: white !important;
     padding: 25px;
     border-radius: 20px;
     border: 2px solid #22c55e !important;
 }
-
 #check-button {
     background: #f25c05 !important;
     color: white !important;
-    border: none !important;
-    height: 58px;
-    border-radius: 12px;
-    font-size: 20px !important;
+    border: 2px solid #111827 !important;
+    height: 60px;
+    border-radius: 14px;
+    font-size: 21px !important;
     font-weight: bold;
 }
-
 .result-card {
     background: white !important;
     color: #172033 !important;
     padding: 30px;
     border-radius: 22px;
-    margin-top: 20px;
+    margin-top: 25px;
     direction: rtl;
     text-align: right;
     font-family: Arial, sans-serif;
     box-shadow: 0 8px 30px rgba(0,0,0,.15);
 }
-
 .result-title {
     color: #166534 !important;
     text-align: center;
     font-size: 28px;
+}
+.updated-at {
+    color: #64748b !important;
+    text-align: center;
+    font-size: 13px;
 }
 .green-line {
     border: 0;
     border-top: 2px solid #22c55e;
     margin: 20px 0;
 }
-
-.info-section { margin-top: 25px; }
-.info-label { color: #64748b !important; font-size: 17px; }
+.info-section {
+    margin-top: 25px;
+}
+.info-label {
+    color: #64748b !important;
+    font-size: 17px;
+}
 .info-value {
     color: #111827 !important;
-    font-size: 25px;
+    font-size: 24px;
     font-weight: bold;
+    margin-top: 5px;
 }
-.crop-value { color: #166534 !important; }
+.crop-value {
+    color: #166534 !important;
+}
 .temperature-value {
     color: #111827 !important;
-    font-size: 32px;
+    font-size: 30px;
     font-weight: bold;
+    margin-top: 5px;
 }
-
 .risk-badge {
     display: inline-block;
     margin-top: 8px;
     padding: 10px 25px;
     border-radius: 30px;
-    font-size: 22px;
+    font-size: 21px;
     font-weight: bold;
     border: 1px solid;
 }
 .risk-period {
     color: #111827 !important;
-    font-size: 20px;
+    font-size: 18px;
     font-weight: bold;
     margin-top: 8px;
 }
-
 .recommendation {
     margin-top: 30px;
     padding: 20px;
     border-radius: 15px;
     color: #334155 !important;
-    font-size: 18px;
+    font-size: 17px;
     line-height: 2;
 }
-.recommendation p,
-.recommendation b {
+.recommendation p {
     color: #334155 !important;
 }
 .recommendation b {
     color: #166534 !important;
     font-size: 20px;
 }
-
-.forecast-section { margin-top: 35px; }
+.forecast-section {
+    margin-top: 35px;
+}
 .forecast-title {
     color: #166534 !important;
     font-size: 23px;
 }
-.forecast-wrapper { overflow-x: auto; width: 100%; }
+.forecast-wrapper {
+    overflow-x: auto;
+    width: 100%;
+}
 .forecast-table {
     width: 100%;
     border-collapse: collapse;
@@ -561,6 +733,7 @@ body { background: #052e16 !important; }
     margin-top: 25px;
     color: #64748b !important;
     font-size: 13px;
+    line-height: 1.8;
 }
 .error-card {
     background: #fee2e2 !important;
@@ -571,35 +744,40 @@ body { background: #052e16 !important; }
     text-align: right;
     margin-top: 20px;
 }
-.error-card h2, .error-card p { color: #991b1b !important; }
+.error-card h2,
+.error-card p {
+    color: #991b1b !important;
+}
 """
 
 
 # ==========================================================
-# Gradio Interface
+# 10. Gradio Interface
 # ==========================================================
 with gr.Blocks(
-    title="🇯🇴 نظام الإنذار المبكر لخطر الصقيع",
+    title="نظام الإنذار المبكر لخطر الصقيع",
     css=css,
 ) as app:
 
     gr.HTML("""
-    <div class="header">
+    <div class="header" dir="rtl">
         <h1>🇯🇴 نظام الإنذار المبكر لخطر الصقيع</h1>
         <p>نظام ذكي للتنبؤ بخطر الصقيع في الأردن</p>
-        <p>اختر موقعك في الأردن لمعرفة مستوى خطر الصقيع المتوقع.</p>
+        <p>اختاري موقعك لمعرفة مستوى الخطر المتوقع للمحصول.</p>
     </div>
     """)
 
     with gr.Column(elem_classes="location-box"):
+
         gr.HTML("""
-        <div dir="rtl" style="text-align:right;padding-bottom:15px;
-             margin-bottom:20px;border-bottom:3px solid #22c55e">
+        <div dir="rtl"
+             style="text-align:right;padding-bottom:15px;
+                    margin-bottom:20px;border-bottom:3px solid #22c55e">
             <h2 style="color:#166534;margin:0 0 8px 0;font-size:26px">
                 📍 اختر موقعك
             </h2>
             <p style="color:#475569">
-                حدد المحافظة والمنطقة والمحصول للحصول على نتيجة مخصصة.
+                حددي المحافظة والمنطقة والمحصول للحصول على نتيجة مخصصة.
             </p>
         </div>
         """)
@@ -610,6 +788,7 @@ with gr.Blocks(
                 value="عمّان",
                 label="📍 المحافظة",
             )
+
             area = gr.Dropdown(
                 choices=list(jordan_locations["عمّان"].keys()),
                 value="عمّان",
@@ -643,9 +822,11 @@ with gr.Blocks(
     )
 
 
+# ==========================================================
+# 11. Start Server
+# ==========================================================
 if __name__ == "__main__":
     app.launch(
         server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", "7860")),
-        share=False,
+        server_port=int(os.environ.get("PORT", "10000")),
     )
