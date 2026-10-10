@@ -1,42 +1,25 @@
-import os
+
 import time
-import joblib
 import requests
 import pandas as pd
-import gradio as gr
 
-
-# =========================
-# Load Model
-# =========================
-model = joblib.load("frost_random_forest.pkl")
-model_info = joblib.load("frost_model_info.pkl")
-
-features = model_info["features"]
-threshold = model_info.get("threshold", 0.20)
-
-
-# =========================
-# Weather Cache
-# =========================
+# Cache for successful weather responses
 weather_cache = {}
 
-CACHE_DURATION = 15 * 60  # 15 minutes
+CACHE_DURATION = 30 * 60       # 30 minutes
+MAX_STALE_DURATION = 6 * 60 * 60  # 6 hours
 
 
-# =========================
-# Get Weather
-# =========================
 def get_weather(latitude, longitude):
-
     cache_key = (round(latitude, 4), round(longitude, 4))
-    current_time = time.time()
+    now = time.time()
 
-    # Use cached data if available
-    if cache_key in weather_cache:
-        cached_time, cached_data = weather_cache[cache_key]
+    cached = weather_cache.get(cache_key)
 
-        if current_time - cached_time < CACHE_DURATION:
+    # 1. Return fresh cached data without calling the API
+    if cached:
+        cached_time, cached_data = cached
+        if now - cached_time < CACHE_DURATION:
             return cached_data.copy()
 
     url = "https://api.open-meteo.com/v1/forecast"
@@ -56,49 +39,88 @@ def get_weather(latitude, longitude):
         "forecast_days": 3
     }
 
-    # Retry if API temporarily returns 429
-    for attempt in range(3):
+    last_error = None
 
+    # 2. Retry a limited number of times with backoff
+    for attempt in range(3):
         try:
             response = requests.get(
                 url,
                 params=params,
-                timeout=30
+                timeout=20
             )
 
             if response.status_code == 429:
+                last_error = "Open-Meteo returned HTTP 429"
 
                 if attempt < 2:
-                    wait_time = 10 * (attempt + 1)
-                    time.sleep(wait_time)
+                    retry_after = response.headers.get("Retry-After")
+                    try:
+                        wait = float(retry_after)
+                    except (TypeError, ValueError):
+                        wait = 5 * (2 ** attempt)
+
+                    # Avoid excessively long blocking waits
+                    time.sleep(min(wait, 20))
                     continue
 
-                raise Exception(
-                    "خدمة الطقس مشغولة حاليًا. حاول مرة أخرى بعد دقائق."
-                )
+                break
 
             response.raise_for_status()
+            payload = response.json()
 
-            data = response.json()
+            if "hourly" not in payload:
+                raise ValueError("Weather response has no hourly data")
 
-            weather = pd.DataFrame(data["hourly"])
+            weather = pd.DataFrame(payload["hourly"])
 
-            # Save to cache
+            required_columns = [
+                "time",
+                "temperature_2m",
+                "relative_humidity_2m",
+                "dew_point_2m",
+                "precipitation",
+                "cloud_cover",
+                "wind_speed_10m"
+            ]
+
+            missing = [
+                col for col in required_columns
+                if col not in weather.columns
+            ]
+
+            if missing:
+                raise ValueError(
+                    f"Missing weather fields: {missing}"
+                )
+
+            # Save only successful responses
             weather_cache[cache_key] = (
-                current_time,
+                time.time(),
                 weather.copy()
             )
 
             return weather
 
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.RequestException as exc:
+            last_error = str(exc)
 
             if attempt < 2:
-                time.sleep(5)
-                continue
+                time.sleep(2 * (2 ** attempt))
 
-            raise Exception(
-                "تعذر الاتصال بخدمة الطقس حاليًا. حاول مرة أخرى لاحقًا."
-            ) from e
+        except (ValueError, KeyError) as exc:
+            last_error = str(exc)
+            break
 
-    raise Exception("تعذر الحصول على بيانات الطقس.")
+    # 3. If the API fails, use previously successful data
+    if cached:
+        cached_time, cached_data = cached
+
+        if time.time() - cached_time <= MAX_STALE_DURATION:
+            return cached_data.copy()
+
+    raise RuntimeError(
+        "تعذر جلب بيانات الطقس حاليًا، ولا توجد بيانات محفوظة "
+        "حديثة بما يكفي. انتظري قليلًا ثم حاولي مرة أخرى. "
+        f"التفاصيل: {last_error}"
+    )
