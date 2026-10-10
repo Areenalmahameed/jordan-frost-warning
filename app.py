@@ -4,7 +4,7 @@ import os
 import json
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 import gradio as gr
 import joblib
@@ -13,7 +13,7 @@ import requests
 
 
 # ==========================================================
-# 1. Load Model
+# 1. Model and Configuration
 # ==========================================================
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -21,26 +21,34 @@ MODEL_PATH = BASE_DIR / "frost_random_forest.pkl"
 INFO_PATH = BASE_DIR / "frost_model_info.pkl"
 CACHE_FILE = BASE_DIR / "weather_cache.json"
 
-WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+MET_NORWAY_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
 
 CACHE_DURATION = 6 * 60 * 60
 MAX_STALE_DURATION = 48 * 60 * 60
+REQUEST_TIMEOUT = 15
 
 if not MODEL_PATH.exists() or not INFO_PATH.exists():
     raise FileNotFoundError(
         "تأكدي من وجود frost_random_forest.pkl "
-        "و frost_model_info.pkl بجانب app.py"
+        "و frost_model_info.pkl بجانب app.py."
     )
 
 model = joblib.load(MODEL_PATH)
 model_info = joblib.load(INFO_PATH)
 
-features = model_info["features"]
+features = list(model_info["features"])
 threshold = float(model_info.get("threshold", 0.20))
+
+# Shared HTTP session.
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "JordanFrostWarning/1.0 (weather forecast application)"
+})
 
 
 # ==========================================================
-# 2. Persistent Weather Cache
+# 2. Persistent Local Cache
 # ==========================================================
 def load_cache():
     try:
@@ -48,8 +56,8 @@ def load_cache():
             with open(CACHE_FILE, "r", encoding="utf-8") as file:
                 data = json.load(file)
                 return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        pass
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[CACHE] Load error: {exc}", flush=True)
 
     return {}
 
@@ -58,7 +66,6 @@ weather_cache = load_cache()
 
 
 def save_cache():
-    """Save successful forecasts to disk."""
     temp_file = CACHE_FILE.with_suffix(".tmp")
 
     try:
@@ -68,7 +75,7 @@ def save_cache():
         os.replace(temp_file, CACHE_FILE)
 
     except (OSError, TypeError, ValueError) as exc:
-        print(f"[CACHE] Could not save cache: {exc}", flush=True)
+        print(f"[CACHE] Save error: {exc}", flush=True)
 
 
 def cache_key_for(latitude, longitude):
@@ -83,8 +90,7 @@ def get_cached_weather(key):
 
     try:
         timestamp = float(entry["timestamp"])
-        rows = entry["data"]
-        weather = pd.DataFrame(rows)
+        weather = pd.DataFrame(entry["data"])
 
         if weather.empty:
             return None, None
@@ -95,27 +101,18 @@ def get_cached_weather(key):
         return None, None
 
 
+def store_weather(key, weather):
+    weather_cache[key] = {
+        "timestamp": time.time(),
+        "data": weather.to_dict(orient="records"),
+    }
+    save_cache()
+
+
 # ==========================================================
-# 3. Get Weather
+# 3. Primary Weather Provider: Open-Meteo
 # ==========================================================
-def get_weather(latitude, longitude):
-    latitude = float(latitude)
-    longitude = float(longitude)
-
-    key = cache_key_for(latitude, longitude)
-    now = time.time()
-
-    cached_timestamp, cached_weather = get_cached_weather(key)
-
-    # Return fresh cached data without contacting the API.
-    if (
-        cached_weather is not None
-        and cached_timestamp is not None
-        and 0 <= now - cached_timestamp < CACHE_DURATION
-    ):
-        print(f"[CACHE] Fresh cache used for {key}", flush=True)
-        return cached_weather.copy()
-
+def get_open_meteo(latitude, longitude):
     params = {
         "latitude": latitude,
         "longitude": longitude,
@@ -131,75 +128,214 @@ def get_weather(latitude, longitude):
         "forecast_days": 3,
     }
 
-    last_error = "Unknown error"
+    response = session.get(
+        OPEN_METEO_URL,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+    )
 
-    # Make one request per attempt; avoid excessive API requests.
+    print(
+        f"[WEATHER] Open-Meteo HTTP {response.status_code}",
+        flush=True,
+    )
+
+    response.raise_for_status()
+    payload = response.json()
+
+    if "hourly" not in payload:
+        raise ValueError("Open-Meteo did not return hourly data.")
+
+    weather = pd.DataFrame(payload["hourly"])
+
+    required = [
+        "time",
+        "temperature_2m",
+        "relative_humidity_2m",
+        "dew_point_2m",
+        "precipitation",
+        "cloud_cover",
+        "wind_speed_10m",
+    ]
+
+    missing = [column for column in required
+               if column not in weather.columns]
+
+    if missing or weather.empty:
+        raise ValueError(
+            f"Open-Meteo forecast fields missing: {missing}"
+        )
+
+    return weather[required].copy()
+
+
+# ==========================================================
+# 4. Alternative Weather Provider: MET Norway
+# ==========================================================
+def get_met_norway(latitude, longitude):
+    params = {
+        "lat": latitude,
+        "lon": longitude,
+    }
+
+    headers = {
+        "User-Agent": (
+            "JordanFrostWarning/1.0 "
+            "(Jordan agricultural frost forecast application)"
+        )
+    }
+
+    response = session.get(
+        MET_NORWAY_URL,
+        params=params,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    print(
+        f"[WEATHER] MET Norway HTTP {response.status_code}",
+        flush=True,
+    )
+
+    response.raise_for_status()
+    payload = response.json()
+
+    timeseries = (
+        payload.get("properties", {}).get("timeseries", [])
+    )
+
+    if not timeseries:
+        raise ValueError("Alternative provider returned no forecast.")
+
+    rows = []
+
+    for item in timeseries:
+        time_text = item.get("time")
+        details = (
+            item.get("data", {})
+            .get("instant", {})
+            .get("details", {})
+        )
+
+        if not time_text or not details:
+            continue
+
+        # The provider returns UTC timestamps.
+        try:
+            parsed_time = datetime.fromisoformat(
+                time_text.replace("Z", "+00:00")
+            )
+            local_time = parsed_time.astimezone(
+                timezone.utc
+            ).astimezone(
+                __import__("zoneinfo").ZoneInfo("Asia/Amman")
+            )
+            formatted_time = local_time.strftime("%Y-%m-%dT%H:%M")
+        except (ValueError, TypeError):
+            formatted_time = time_text
+
+        temperature = details.get("air_temperature")
+        humidity = details.get("relative_humidity")
+        dew_point = details.get("dew_point_temperature")
+        cloud_cover = details.get("cloud_area_fraction")
+        wind_speed = details.get("wind_speed")
+
+        next_data = item.get("data", {}).get("next_1_hours", {})
+        precipitation = (
+            next_data.get("details", {}).get("precipitation_amount")
+        )
+
+        # Do not invent missing measurements.
+        required_values = [
+            temperature,
+            humidity,
+            dew_point,
+            cloud_cover,
+            wind_speed,
+            precipitation,
+        ]
+
+        if any(value is None for value in required_values):
+            continue
+
+        rows.append({
+            "time": formatted_time,
+            "temperature_2m": float(temperature),
+            "relative_humidity_2m": float(humidity),
+            "dew_point_2m": float(dew_point),
+            "precipitation": float(precipitation),
+            "cloud_cover": float(cloud_cover),
+            "wind_speed_10m": float(wind_speed) * 3.6,
+        })
+
+    weather = pd.DataFrame(rows)
+
+    if weather.empty:
+        raise ValueError(
+            "البيانات البديلة لا تحتوي على جميع القياسات اللازمة للموديل."
+        )
+
+    weather = weather.drop_duplicates(subset=["time"])
+    weather = weather.sort_values("time").reset_index(drop=True)
+
+    return weather
+
+
+# ==========================================================
+# 5. Weather Retrieval and Fallback
+# ==========================================================
+def get_weather(latitude, longitude):
+    latitude = float(latitude)
+    longitude = float(longitude)
+
+    key = cache_key_for(latitude, longitude)
+    now = time.time()
+
+    cached_timestamp, cached_weather = get_cached_weather(key)
+
+    # Avoid contacting providers if a fresh forecast is available.
+    if (
+        cached_weather is not None
+        and cached_timestamp is not None
+        and 0 <= now - cached_timestamp < CACHE_DURATION
+    ):
+        print(f"[CACHE] Fresh forecast used: {key}", flush=True)
+        return cached_weather.copy()
+
+    errors = []
+
+    # Try the primary provider first.
     try:
-        response = requests.get(
-            WEATHER_URL,
-            params=params,
-            timeout=20,
-            headers={"User-Agent": "JordanFrostWarning/1.0"},
-        )
+        weather = get_open_meteo(latitude, longitude)
+        store_weather(key, weather)
+        print("[WEATHER] Using Open-Meteo forecast.", flush=True)
+        return weather
 
-        print(
-            f"[WEATHER] HTTP status: {response.status_code}",
-            flush=True,
-        )
+    except (
+        requests.exceptions.RequestException,
+        ValueError,
+        KeyError,
+        TypeError,
+    ) as exc:
+        errors.append(f"Open-Meteo: {exc}")
+        print(f"[WEATHER] Primary provider failed: {exc}", flush=True)
 
-        if response.status_code == 429:
-            last_error = "Open-Meteo HTTP 429: Too Many Requests"
+    # Try the alternative provider only after the primary fails.
+    try:
+        weather = get_met_norway(latitude, longitude)
+        store_weather(key, weather)
+        print("[WEATHER] Using MET Norway forecast.", flush=True)
+        return weather
 
-        else:
-            response.raise_for_status()
-            payload = response.json()
+    except (
+        requests.exceptions.RequestException,
+        ValueError,
+        KeyError,
+        TypeError,
+    ) as exc:
+        errors.append(f"MET Norway: {exc}")
+        print(f"[WEATHER] Alternative provider failed: {exc}", flush=True)
 
-            if "hourly" not in payload:
-                raise ValueError(
-                    "لم تُرجع خدمة الطقس بيانات الساعات المطلوبة."
-                )
-
-            weather = pd.DataFrame(payload["hourly"])
-
-            required = [
-                "time",
-                "temperature_2m",
-                "relative_humidity_2m",
-                "dew_point_2m",
-                "precipitation",
-                "cloud_cover",
-                "wind_speed_10m",
-            ]
-
-            missing = [
-                column for column in required
-                if column not in weather.columns
-            ]
-
-            if missing:
-                raise ValueError(
-                    f"Missing weather fields: {missing}"
-                )
-
-            if weather.empty:
-                raise ValueError("بيانات الطقس فارغة.")
-
-            # Save the forecast and its retrieval timestamp.
-            weather_cache[key] = {
-                "timestamp": time.time(),
-                "data": weather.to_dict(orient="records"),
-            }
-            save_cache()
-
-            return weather
-
-    except requests.exceptions.RequestException as exc:
-        last_error = str(exc)
-
-    except (ValueError, KeyError, TypeError) as exc:
-        last_error = str(exc)
-
-    # If the API fails, use a previously saved forecast if recent enough.
+    # Use a previous successful forecast only within the allowed age.
     cached_timestamp, cached_weather = get_cached_weather(key)
 
     if cached_weather is not None and cached_timestamp is not None:
@@ -207,26 +343,24 @@ def get_weather(latitude, longitude):
 
         if 0 <= age <= MAX_STALE_DURATION:
             print(
-                f"[CACHE] Using saved forecast for {key}; "
-                f"age={age / 3600:.1f} hours",
+                f"[CACHE] Using saved forecast; age={age / 3600:.1f}h",
                 flush=True,
             )
             return cached_weather.copy()
 
     raise RuntimeError(
-        "تعذر جلب بيانات الطقس حاليًا، ولا توجد بيانات محفوظة "
-        "صالحة لهذا الموقع. انتظري قليلًا ثم حاولي مرة أخرى. "
-        f"Details: {last_error}"
+        "تعذر الحصول على بيانات الطقس من المصدرين، "
+        "ولا توجد بيانات سابقة صالحة لهذا الموقع. "
+        + " | ".join(errors)
     )
 
 
 # ==========================================================
-# 4. Frost Risk Prediction
+# 6. Frost Prediction
 # ==========================================================
 def check_frost_risk(latitude, longitude):
     weather = get_weather(latitude, longitude)
 
-    # Match API column names to the model's expected feature names.
     rename_map = {
         "temperature_2m": "temperature_2m (°C)",
         "relative_humidity_2m": "relative_humidity_2m (%)",
@@ -238,25 +372,39 @@ def check_frost_risk(latitude, longitude):
 
     weather = weather.rename(columns=rename_map).copy()
 
-    missing = [feature for feature in features
-               if feature not in weather.columns]
+    missing = [
+        feature for feature in features
+        if feature not in weather.columns
+    ]
 
     if missing:
         raise ValueError(
-            "خصائص الطقس لا تتطابق مع الموديل. "
-            f"الخصائص المفقودة: {missing}"
+            "خصائص الطقس لا تتطابق مع الموديل: "
+            f"{missing}"
         )
 
-    # Keep the exact feature order used during training.
     X = weather[features].copy()
-    probabilities = model.predict_proba(X)
 
+    # Ensure model inputs are numeric.
+    for column in X.columns:
+        X[column] = pd.to_numeric(X[column], errors="coerce")
+
+    valid_rows = X.notna().all(axis=1)
+
+    if not valid_rows.any():
+        raise ValueError(
+            "لا توجد ساعات تحتوي على قياسات مكتملة للموديل."
+        )
+
+    weather = weather.loc[valid_rows].copy()
+    X = X.loc[valid_rows]
+
+    probabilities = model.predict_proba(X)
     classes = list(model.classes_)
 
     if 1 not in classes:
         raise ValueError(
-            "الموديل لا يحتوي على الفئة 1 الخاصة بالصقيع. "
-            "راجعي ترميز الفئات عند التدريب."
+            "لم يتم العثور على فئة الصقيع (1) في الموديل."
         )
 
     frost_index = classes.index(1)
@@ -265,11 +413,11 @@ def check_frost_risk(latitude, longitude):
         weather["frost_probability"] >= threshold
     ).astype(int)
 
-    return weather
+    return weather.reset_index(drop=True)
 
 
 # ==========================================================
-# 5. Jordan Locations
+# 7. Jordan Locations
 # ==========================================================
 jordan_locations = {
     "عمّان": {
@@ -340,7 +488,7 @@ jordan_locations = {
 
 
 # ==========================================================
-# 6. Crop Types and Advice
+# 8. Crop Types and Advice
 # ==========================================================
 crop_types = {
     "🥬 خضروات ورقية": {
@@ -382,7 +530,7 @@ crop_types = {
 
 
 # ==========================================================
-# 7. Generate Result
+# 9. Result HTML
 # ==========================================================
 def predict_frost_final(governorate, area, crop):
     try:
@@ -396,13 +544,12 @@ def predict_frost_final(governorate, area, crop):
         latitude, longitude = jordan_locations[governorate][area]
         crop_info = crop_types[crop]
 
-        weather = check_frost_risk(latitude, longitude).copy()
+        weather = check_frost_risk(latitude, longitude)
 
         min_temperature = float(
             weather["temperature_2m (°C)"].min()
         )
 
-        # Use the highest predicted probability in the forecast.
         probability = float(weather["frost_probability"].max())
         probability_percent = probability * 100
 
@@ -415,23 +562,17 @@ def predict_frost_final(governorate, area, crop):
                 "تابعي التحديثات الجوية واستشيري الإرشادات "
                 "الزراعية المحلية بشأن حماية المحصول."
             )
-
         elif probability_percent >= 10:
             level = "🟡 خطر متوسط"
             color = "#d97706"
             background = "#fef3c7"
             risk_message = "توجد احتمالية متوسطة للصقيع وفق الموديل."
-            action = (
-                "تابعي درجات الحرارة خلال الليل والصباح الباكر."
-            )
-
+            action = "تابعي درجات الحرارة خلال الليل والصباح الباكر."
         else:
             level = "🟢 خطر منخفض"
             color = "#16a34a"
             background = "#dcfce7"
-            risk_message = (
-                "احتمال الصقيع منخفض وفق توقعات الموديل الحالية."
-            )
+            risk_message = "احتمال الصقيع منخفض وفق توقعات الموديل الحالية."
             action = "استمري بمتابعة التحديثات الجوية."
 
         risk_hours = weather[
@@ -447,7 +588,6 @@ def predict_frost_final(governorate, area, crop):
                 "لا توجد ساعات تجاوزت عتبة الخطر المحددة في الموديل."
             )
 
-        # Display the next six forecast entries.
         hours_html = ""
 
         for _, row in weather.head(6).iterrows():
@@ -461,11 +601,9 @@ def predict_frost_final(governorate, area, crop):
             else:
                 status = "🟢 منخفض"
 
-            forecast_time = str(row["time"])
-
             hours_html += f"""
                 <tr>
-                    <td>{forecast_time}</td>
+                    <td>{row["time"]}</td>
                     <td>{temp:.1f} °C</td>
                     <td>{pct:.1f}%</td>
                     <td>{status}</td>
@@ -539,9 +677,9 @@ def predict_frost_final(governorate, area, crop):
             </div>
 
             <p class="disclaimer">
-                النتيجة تقديرية وتعتمد على الموديل المدرب وبيانات الطقس.
-                احتمال الصقيع الذي يعرضه التطبيق هو تقدير الموديل،
-                وليس بالضرورة احتمالًا رسميًا صادرًا عن خدمة الطقس.
+                النتيجة تقديرية وتعتمد على الموديل وبيانات الطقس المتاحة.
+                احتمال الصقيع المعروض هو تقدير الموديل وليس بالضرورة
+                احتمالًا رسميًا صادرًا عن خدمة الطقس.
             </p>
         </div>
         """
@@ -566,7 +704,7 @@ def predict_frost_final(governorate, area, crop):
 
 
 # ==========================================================
-# 8. Update Areas When Governorate Changes
+# 10. Update Areas
 # ==========================================================
 def update_area(governorate):
     areas = list(jordan_locations[governorate].keys())
@@ -579,7 +717,7 @@ def update_area(governorate):
 
 
 # ==========================================================
-# 9. CSS Design
+# 11. CSS
 # ==========================================================
 css = """
 .gradio-container {
@@ -752,7 +890,7 @@ body {
 
 
 # ==========================================================
-# 10. Gradio Interface
+# 12. Gradio Interface
 # ==========================================================
 with gr.Blocks(
     title="نظام الإنذار المبكر لخطر الصقيع",
@@ -823,7 +961,7 @@ with gr.Blocks(
 
 
 # ==========================================================
-# 11. Start Server
+# 13. Start Server
 # ==========================================================
 if __name__ == "__main__":
     app.launch(
