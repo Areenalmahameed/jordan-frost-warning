@@ -29,17 +29,22 @@ threshold = float(model_info.get("threshold", 0.20))
 # Weather API + Cache
 # ==========================================================
 weather_cache = {}
-CACHE_DURATION = 30 * 60
-MAX_STALE_DURATION = 6 * 60 * 60
+CACHE_DURATION =  6 * 60 * 60
+MAX_STALE_DURATION = 48 * 60 * 60
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 
 
 def get_weather(latitude, longitude):
-    cache_key = (round(float(latitude), 4), round(float(longitude), 4))
+    cache_key = (
+        round(float(latitude), 4),
+        round(float(longitude), 4),
+    )
+
     now = time.time()
     cached = weather_cache.get(cache_key)
 
-    if cached and now - cached[0] < CACHE_DURATION:
+    # Return fresh cached forecast without making another API request.
+    if cached and 0 <= now - cached[0] < CACHE_DURATION:
         return cached[1].copy()
 
     params = {
@@ -59,33 +64,24 @@ def get_weather(latitude, longitude):
 
     last_error = "Unknown error"
 
-    for attempt in range(3):
-        try:
-            response = requests.get(
-                WEATHER_URL,
-                params=params,
-                timeout=20,
-            )
+    # Only one request per call: avoid increasing rate limits with retries.
+    try:
+        response = requests.get(
+            WEATHER_URL,
+            params=params,
+            timeout=20,
+        )
 
-            if response.status_code == 429:
-                last_error = "Open-Meteo HTTP 429: Too Many Requests"
-
-                if attempt < 2:
-                    retry_after = response.headers.get("Retry-After")
-                    try:
-                        wait_seconds = max(1, float(retry_after))
-                    except (TypeError, ValueError):
-                        wait_seconds = 5 * (2 ** attempt)
-
-                    time.sleep(min(wait_seconds, 20))
-                    continue
-                break
-
+        if response.status_code == 429:
+            last_error = "Open-Meteo HTTP 429: Too Many Requests"
+        else:
             response.raise_for_status()
             payload = response.json()
 
             if "hourly" not in payload:
-                raise ValueError("Weather API did not return hourly data")
+                raise ValueError(
+                    "Weather API did not return hourly data"
+                )
 
             weather = pd.DataFrame(payload["hourly"])
 
@@ -99,34 +95,51 @@ def get_weather(latitude, longitude):
                 "wind_speed_10m",
             ]
 
-            missing = [c for c in required if c not in weather.columns]
+            missing = [
+                column for column in required
+                if column not in weather.columns
+            ]
+
             if missing:
-                raise ValueError(f"Missing weather fields: {missing}")
+                raise ValueError(
+                    f"Missing weather fields: {missing}"
+                )
 
             if weather.empty:
-                raise ValueError("Weather API returned an empty forecast")
+                raise ValueError(
+                    "Weather API returned an empty forecast"
+                )
 
-            weather_cache[cache_key] = (time.time(), weather.copy())
+            # Store successful forecast in memory.
+            weather_cache[cache_key] = (
+                time.time(),
+                weather.copy(),
+            )
+
             return weather
 
-        except requests.exceptions.RequestException as exc:
-            last_error = str(exc)
-            if attempt < 2:
-                time.sleep(2 * (2 ** attempt))
+    except requests.exceptions.RequestException as exc:
+        last_error = str(exc)
 
-        except (ValueError, KeyError) as exc:
-            last_error = str(exc)
-            break
+    except (ValueError, KeyError, TypeError) as exc:
+        last_error = str(exc)
 
-    # Use cached data only when a previous successful response exists.
-    if cached and time.time() - cached[0] <= MAX_STALE_DURATION:
-        return cached[1].copy()
+    # If the API fails, use a previously successful cached forecast
+    # only when it is within the allowed age.
+    cached = weather_cache.get(cache_key)
+
+    if cached:
+        age = time.time() - cached[0]
+
+        if 0 <= age <= MAX_STALE_DURATION:
+            return cached[1].copy()
 
     raise RuntimeError(
-        "تعذر جلب بيانات الطقس حاليًا، ولا توجد بيانات محفوظة "
-        "حديثة بما يكفي. حاولي مرة أخرى لاحقًا. "
+        "تعذر جلب بيانات الطقس حاليًا، ولا توجد بيانات "
+        "محفوظة يمكن استخدامها. حاولي لاحقًا. "
         f"Details: {last_error}"
     )
+
 
 
 def check_frost_risk(latitude, longitude):
