@@ -38,8 +38,9 @@ model = joblib.load(MODEL_PATH)
 model_info = joblib.load(INFO_PATH)
 
 features = list(model_info["features"])
-print("[MODEL FEATURES]", features, flush=True)
 threshold = float(model_info.get("threshold", 0.20))
+
+print("[MODEL FEATURES]", features, flush=True)
 
 # Shared HTTP session.
 session = requests.Session()
