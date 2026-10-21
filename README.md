@@ -94,4 +94,5 @@ The application is deployed using Render and provides a public web interface.
 Areen Al Mahameed
 <img width="1062" height="871" alt="Screenshot 2026-10-21 171450" src="https://github.com/user-attachments/assets/ca12ec3c-267c-4a82-ad17-8860543d33fc" />
 
+<img width="533" height="887" alt="Screenshot 2026-10-21 171502" src="https://github.com/user-attachments/assets/7a2a8638-42bc-451e-a477-1799f4f3de0a" />
 
