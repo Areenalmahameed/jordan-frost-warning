@@ -92,3 +92,6 @@ The application is deployed using Render and provides a public web interface.
 ## 👩‍💻 Author
 
 Areen Al Mahameed
+<img width="1062" height="871" alt="Screenshot 2026-10-21 171450" src="https://github.com/user-attachments/assets/ca12ec3c-267c-4a82-ad17-8860543d33fc" />
+
+
